@@ -1,0 +1,18 @@
+SELECT
+    (DATE(dw_user_events_daily.event_date )) AS "dw_user_events_daily.event_date_date",
+    COUNT(DISTINCT CASE WHEN ( dw_user_events_daily.is_active  ) AND ( dw_user_events_daily.is_valid_user ) THEN dw_user_events_daily.user_id  ELSE NULL END) AS "dw_user_events_daily.active_users"
+FROM analytics.dw_user_events_daily  AS dw_user_events_daily
+LEFT JOIN analytics.dw_users  AS dw_users ON dw_user_events_daily.user_id  = dw_users.user_id
+WHERE ((( dw_user_events_daily.enrolled_joined_at  ) >= ((TIMESTAMP '2024-04-01')) AND ( dw_user_events_daily.enrolled_joined_at  ) < ((DATEADD(day,1, TIMESTAMP '2024-04-01' ))))) AND ((( CASE
+WHEN coalesce(dw_user_events_daily.enrolled_home_domain,'us')='us'  THEN 'us'
+ELSE 'New Home Domain'
+END ) ILIKE  'us') AND (( CASE
+WHEN dw_user_events_daily.enrolled_reg_app in ('iphone','ipad')  THEN 'iOS'
+ELSE 'Other'
+END ) ILIKE  'iOS'))
+AND ((datediff(day,(DATE(dw_user_events_daily.enrolled_joined_at )),(DATE(dw_user_events_daily.event_date )))+1 ) < 31 AND ((NOT (coalesce((datediff(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),(CASE WHEN dw_users.user_status = 'restricted' THEN dw_users.status_updated_at ELSE NULL END)) + 1) <= 30, FALSE) ) OR (coalesce((datediff(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),(CASE WHEN dw_users.user_status = 'restricted' THEN dw_users.status_updated_at ELSE NULL END)) + 1) <= 30, FALSE) ) IS NULL) AND ((coalesce(dw_user_events_daily.app, 'unknown')) in ('unknown','iphone','ipad','external','android','web') )))
+GROUP BY
+    1
+ORDER BY
+    1
+LIMIT 5000;
