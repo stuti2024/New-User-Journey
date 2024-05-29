@@ -47,6 +47,16 @@ order by 2 ,5  ;
 
 select count(distinct user_id) from user_activity ;
 
+drop table if exists timelag ;
+create temp table timelag as
+select distinct ua.user_id,ua.time_stamp,ua.prevtime_stamp,datediff(seconds,ua.prevtime_stamp,ua.time_stamp) as date_diff_seconds,ua.rank_users
+from (select distinct user_id,date,time_stamp,lag(time_stamp,1) over(partition by user_id order by rank_users) as prevtime_stamp,rank_users
+    from user_activity
+order by rank_users) as ua
+order by ua.time_stamp
+;
+
+-- Duration spend on the platform by users returning between D2-D7
 drop table if exists returned_users ;
 create temp table returned_users as
 SELECT
@@ -74,66 +84,23 @@ GROUP BY
 ORDER BY
     1
 ;
-drop table if exists returned_user_activity ;
-create temp table returned_user_activity as
-select   returned_users.joined_date as date ,
-      (TIMESTAMP 'epoch' + r.at * INTERVAL '1 second') as time_stamp,
-       r.direct_object.name as page_viewed,r.verb as verb,
-       returned_users.user_id as user_id,
-       rank() over (partition by user_id order by time_stamp ) as rank_users
-from returned_users
-inner join external_spark_tables.raw_events r on returned_users.user_id =  r.actor.id and returned_users.joined_date = r.event_date
-where
-r.verb in('view','click')
-and r.using.app_type in ('iphone','ipad')
-and r.using.domain in ('us')
-and r.actor.id is not null
-and r.direct_object.name is not null
-and r.actor.type in ('user')
-and returned_users.joined_date = '2024-04-01'
-group by 1,2,3,4,5
-order by 2 ,5  ;
-drop table if exists timelag ;
-create temp table timelag as
-select distinct ua.user_id,ua.time_stamp,ua.prevtime_stamp,datediff(seconds,ua.prevtime_stamp,ua.time_stamp) as date_diff_seconds,ua.rank_users
-from (select distinct user_id,date,time_stamp,lag(time_stamp,1) over(partition by user_id order by rank_users) as prevtime_stamp,rank_users
-    from returned_user_activity
-order by rank_users) as ua
-order by ua.time_stamp
-;
-select distinct user_id ,sum(case when date_diff_seconds<180 then date_diff_seconds else null end ) as duration from timelag  group by 1 order by 2 desc;
---Not returned users
+
+with cte as(
+select distinct user_id ,sum(case when date_diff_seconds<180 then date_diff_seconds else null end ) as duration from timelag group by 1 order by 2 desc )
+select distinct cte.user_id,duration from cte join returned_users on cte.user_id = returned_users.user_id order by 2 desc ;
+--Not returned users between D2-D7 duration used on D1 
 drop table if exists not_returned ;
 create temp table not_returned as
 SELECT distinct user_id,new_users.joined_date
 from new_users LEFT JOIN returned_users using (user_id) where returned_users.user_id is null ;
 
-drop table if exists not_returned_user_activity ;
-create temp table not_returned_user_activity as
-select   not_returned.joined_date as date ,
-      (TIMESTAMP 'epoch' + r.at * INTERVAL '1 second') as time_stamp,
-       r.direct_object.name as page_viewed,r.verb as verb,
-       not_returned.user_id as user_id,
-       rank() over (partition by user_id order by time_stamp ) as rank_users
-from not_returned
-inner join external_spark_tables.raw_events r on not_returned.user_id =  r.actor.id and not_returned.joined_date = r.event_date
-where
-r.verb in('view','click')
-and r.using.app_type in ('iphone','ipad')
-and r.using.domain in ('us')
-and r.actor.id is not null
-and r.direct_object.name is not null
-and r.actor.type in ('user')
-and not_returned.joined_date = '2024-04-01'
-group by 1,2,3,4,5
-order by 2 ,5  ;
-select distinct user_id ,sum(case when date_diff_seconds<180 then date_diff_seconds else null end ) as duration from timelag  group by 1 order by 2 desc;
-drop table if exists timelag ;
-create temp table timelag as
-select distinct ua.user_id,ua.time_stamp,ua.prevtime_stamp,datediff(seconds,ua.prevtime_stamp,ua.time_stamp) as date_diff_seconds,ua.rank_users
-from (select distinct user_id,date,time_stamp,lag(time_stamp,1) over(partition by user_id order by rank_users) as prevtime_stamp,rank_users
-    from not_returned_user_activity
-order by rank_users) as ua
-order by ua.time_stamp
-;
-select distinct user_id ,sum(case when date_diff_seconds<180 then date_diff_seconds else null end ) as duration from timelag  group by 1 order by 2 desc;
+with cte as (select distinct user_id,
+                             sum(case when date_diff_seconds < 180 then date_diff_seconds else null end) as duration
+             from timelag
+
+             group by 1
+             order by 2 desc)
+select distinct joined_date, cte.user_id, duration
+from cte
+         join not_returned on cte.user_id = not_returned.user_id
+order by 3 desc ;
