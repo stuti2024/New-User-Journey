@@ -1,3 +1,52 @@
+drop table if exists new_users ;
+create temp table new_users as
+SELECT
+    DISTINCT CASE WHEN NOT COALESCE(( coalesce((datediff(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),
+                                                         (CASE WHEN dw_users.user_status = 'restricted' THEN dw_users.status_updated_at ELSE NULL END)) + 1) <= 30, FALSE)  ), FALSE) THEN dw_users.user_id  ELSE NULL END  AS "user_id",
+    (DATE(coalesce(dw_users.guest_joined_at, dw_users.joined_at) )) AS "joined_date"
+FROM analytics.dw_users  AS dw_users
+WHERE (( dw_users.home_domain  ) ILIKE  'us') AND ((( coalesce(dw_users.guest_joined_at, dw_users.joined_at)  ) >= ((TIMESTAMP '2024-04-01')) AND ( coalesce(dw_users.guest_joined_at, dw_users.joined_at)  ) < ((DATEADD(day,1, TIMESTAMP '2024-04-01' ))))) AND (( CASE
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) in ('iphone','ipad')  THEN 'iOS'
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) = 'android'  THEN 'Android'
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) = 'web'  THEN 'Web'
+ELSE 'Other'
+END ) ILIKE  'iOS') AND ((dw_users.is_valid_user is true))
+GROUP BY
+    1,2
+ORDER BY
+    1 DESC;
+
+select count(distinct user_id) from new_users ;
+
+drop table if exists user_activity ;
+create temp table user_activity as
+select   new_users.joined_date as date ,
+      --(TIMESTAMP 'epoch' + r.at * INTERVAL '1 second') as time_stamp,
+      r.event_date::DATE                    AS event_date,
+       f_pm_epoch_to_pacific(r.at)           AS time_stamp,
+       r.direct_object.name as direct_object,
+       r.verb as verb
+       ,r.on.name as on_name
+       ,new_users.user_id as user_id,
+       rank() over (partition by user_id order by time_stamp ) as rank_users
+from new_users
+join external_spark_tables.raw_events r on new_users.user_id =  r.actor.id and new_users.joined_date = r.event_date
+where
+r.verb in('view','click','like','post','share','update','block','book','post','follow','search','sign_up','sign_in')
+and r.using.app_type in ('iphone','ipad')
+and r.using.domain in ('us')
+and r.actor.id is not null
+and r.direct_object.name is not null
+and r.on.name is not null
+and r.actor.type in ('user')
+and new_users.joined_date = '2024-04-01'
+and r.event_date = '2024-04-01'
+group by 1,2,3,4,5,6,7
+--having date(time_stamp) = '2024-04-01'
+order by 2 ,5  ;
+
+select count(distinct user_id) from user_activity ;
+
 drop table if exists returned_users ;
 create temp table returned_users as
 SELECT
