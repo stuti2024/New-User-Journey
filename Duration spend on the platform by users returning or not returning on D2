@@ -1,0 +1,105 @@
+drop table if exists new_users ;
+create temp table new_users as
+SELECT
+    DISTINCT CASE WHEN NOT COALESCE(( coalesce((datediff(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),
+                                                         (CASE WHEN dw_users.user_status = 'restricted' THEN dw_users.status_updated_at ELSE NULL END)) + 1) <= 30, FALSE)  ), FALSE) THEN dw_users.user_id  ELSE NULL END  AS "user_id",
+    (DATE(coalesce(dw_users.guest_joined_at, dw_users.joined_at) )) AS "joined_date"
+FROM analytics.dw_users  AS dw_users
+WHERE (( dw_users.home_domain  ) ILIKE  'us') AND ((( coalesce(dw_users.guest_joined_at, dw_users.joined_at)  ) >= ((TIMESTAMP '2024-04-01')) AND ( coalesce(dw_users.guest_joined_at, dw_users.joined_at)  ) < ((DATEADD(day,1, TIMESTAMP '2024-04-01' ))))) AND (( CASE
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) in ('iphone','ipad')  THEN 'iOS'
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) = 'android'  THEN 'Android'
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) = 'web'  THEN 'Web'
+ELSE 'Other'
+END ) ILIKE  'iOS') AND ((dw_users.is_valid_user is true))
+GROUP BY
+    1,2
+ORDER BY
+    1 DESC;
+
+select count(distinct user_id) from new_users ;
+
+drop table if exists user_activity ;
+create temp table user_activity as
+select   new_users.joined_date as date ,
+      --(TIMESTAMP 'epoch' + r.at * INTERVAL '1 second') as time_stamp,
+      r.event_date::DATE                    AS event_date,
+       f_pm_epoch_to_pacific(r.at)           AS time_stamp,
+       r.direct_object.name as direct_object,
+       r.verb as verb
+       ,r.on.name as on_name
+       ,new_users.user_id as user_id,
+       rank() over (partition by user_id order by time_stamp ) as rank_users
+from new_users
+join external_spark_tables.raw_events r on new_users.user_id =  r.actor.id and new_users.joined_date = r.event_date
+where
+r.verb in('view','click','like','post','share','update','block','book','post','follow','search','sign_up','sign_in')
+and r.using.app_type in ('iphone','ipad')
+and r.using.domain in ('us')
+and r.actor.id is not null
+and r.direct_object.name is not null
+and r.on.name is not null
+and r.actor.type in ('user')
+and new_users.joined_date = '2024-04-01'
+and r.event_date = '2024-04-01'
+group by 1,2,3,4,5,6,7
+--having date(time_stamp) = '2024-04-01'
+order by 2 ,5  ;
+
+select count(distinct user_id) from user_activity ;
+
+drop table if exists timelag ;
+create temp table timelag as
+select distinct ua.user_id,ua.time_stamp,ua.prevtime_stamp,datediff(seconds,ua.prevtime_stamp,ua.time_stamp) as date_diff_seconds,ua.rank_users
+from (select distinct user_id,date,time_stamp,lag(time_stamp,1) over(partition by user_id order by rank_users) as prevtime_stamp,rank_users
+    from user_activity
+order by rank_users) as ua
+order by ua.time_stamp
+;
+
+-- Duration spend on the platform by users returning on D2
+drop table if exists returned_users ;
+create temp table returned_users as
+SELECT
+    DISTINCT CASE WHEN ( dw_user_events_daily.is_active  ) AND ( dw_user_events_daily.is_valid_user  ) AND (NOT COALESCE(( coalesce((datediff(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),(CASE WHEN dw_users.user_status = 'restricted' THEN dw_users.status_updated_at ELSE NULL END)) + 1) <= 30, FALSE)  ), FALSE)) THEN dw_user_events_daily.user_id  ELSE NULL END  AS "user_id",
+    (DATE(dw_user_events_daily.enrolled_joined_at )) AS "joined_date",
+        (DATE(dw_user_events_daily.event_date )) AS "event_date_date"
+FROM analytics.dw_user_events_daily  AS dw_user_events_daily
+LEFT JOIN analytics.dw_users  AS dw_users ON dw_user_events_daily.user_id  = dw_users.user_id
+WHERE ((( dw_user_events_daily.enrolled_joined_at  ) >= ((TIMESTAMP '2024-04-01')) AND ( dw_user_events_daily.enrolled_joined_at  ) < ((DATEADD(day,1, TIMESTAMP '2024-04-01' ))))) AND ((( CASE
+WHEN coalesce(dw_user_events_daily.enrolled_home_domain,'us')='us'  THEN 'us'
+WHEN dw_user_events_daily.enrolled_home_domain='ca'  THEN 'ca'
+WHEN dw_user_events_daily.enrolled_home_domain='au'  THEN 'au'
+WHEN dw_user_events_daily.enrolled_home_domain='in'  THEN 'in'
+WHEN dw_user_events_daily.enrolled_home_domain='uk'  THEN 'uk'
+ELSE 'New Home Domain'
+END ) ILIKE  'us') AND (( CASE
+WHEN dw_user_events_daily.enrolled_reg_app in ('iphone','ipad')  THEN 'iOS'
+WHEN dw_user_events_daily.enrolled_reg_app = 'android'  THEN 'Android'
+WHEN dw_user_events_daily.enrolled_reg_app = 'web'  THEN 'Web'
+ELSE 'Other'
+END ) ILIKE  'iOS'))AND (datediff(day,(DATE(dw_user_events_daily.enrolled_joined_at )),(DATE(dw_user_events_daily.event_date )))+1 )  =2 AND ((coalesce(dw_user_events_daily.app, 'unknown')) in ('unknown','iphone','ipad','external','android','web') )
+    1,
+    2,3
+ORDER BY
+    1
+;
+
+with cte as(
+select distinct user_id ,sum(case when date_diff_seconds<180 then date_diff_seconds else null end ) as duration from timelag group by 1 order by 2 desc )
+select distinct cte.user_id,duration from cte join returned_users on cte.user_id = returned_users.user_id order by 2 desc ;
+--Not returned users on D2 duration used on D1 
+drop table if exists not_returned ;
+create temp table not_returned as
+SELECT distinct user_id,new_users.joined_date
+from new_users LEFT JOIN returned_users using (user_id) where returned_users.user_id is null ;
+
+with cte as (select distinct user_id,
+                             sum(case when date_diff_seconds < 180 then date_diff_seconds else null end) as duration
+             from timelag
+
+             group by 1
+             order by 2 desc)
+select distinct joined_date, cte.user_id, duration
+from cte
+         join not_returned on cte.user_id = not_returned.user_id
+order by 3 desc ;
