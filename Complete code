@@ -82,7 +82,7 @@ WHEN dw_user_events_daily.enrolled_reg_app = 'android'  THEN 'Android'
 WHEN dw_user_events_daily.enrolled_reg_app = 'web'  THEN 'Web'
 ELSE 'Other'
 END ) ILIKE  'iOS'))AND (datediff(day,(DATE(dw_user_events_daily.enrolled_joined_at )),(DATE(dw_user_events_daily.event_date )))+1 )  =2 AND ((coalesce(dw_user_events_daily.app, 'unknown')) in ('unknown','iphone','ipad','external','android','web') )
-    1,
+group by   1,
     2,3
 ORDER BY
     1
@@ -320,13 +320,6 @@ group by 1,2,3
 order by 2 desc;
 
 --Last page viewed by users on D1 not returning between D2 - D7
-
-
-drop table if exists not_returned_d2_d7 ;
-create temp table not_returned_d2_d7 as
-SELECT distinct user_id,new_users.joined_date
-from new_users LEFT JOIN returned_users_d2_d7 using (user_id) where returned_users_d2_d7.user_id is null ;
-select count(distinct user_id) from not_returned_d2_d7;
 
 drop table if exists not_returned_user_activity_d2_d7 ;
 create temp table not_returned_user_activity_d2_d7 as
