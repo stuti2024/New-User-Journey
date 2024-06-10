@@ -1,0 +1,280 @@
+drop table if exists new_users ;
+create temp table new_users as
+SELECT
+    DISTINCT CASE WHEN NOT COALESCE(( coalesce((datediff(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),
+                                                         (CASE WHEN dw_users.user_status = 'restricted' THEN dw_users.status_updated_at ELSE NULL END)) + 1) <= 30, FALSE)  ), FALSE) THEN dw_users.user_id  ELSE NULL END  AS "user_id",
+    (DATE(coalesce(dw_users.guest_joined_at, dw_users.joined_at) )) AS "joined_date"
+,date(lister_activated_at) as lister_activation_date
+FROM analytics.dw_users  AS dw_users
+WHERE (( dw_users.home_domain  ) ILIKE  'us') AND ((( coalesce(dw_users.guest_joined_at, dw_users.joined_at)  ) >= ((TIMESTAMP '2024-04-01')) AND ( coalesce(dw_users.guest_joined_at, dw_users.joined_at)  ) <= ((DATEADD(day,1, TIMESTAMP '2024-04-07' ))))) AND (( CASE
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) in ('iphone','ipad')  THEN 'iOS'
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) = 'android'  THEN 'Android'
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) = 'web'  THEN 'Web'
+ELSE 'Other'
+END ) ILIKE  'iOS') AND ((dw_users.is_valid_user is true))
+and user_id is not null
+GROUP BY
+    1,2,3
+ORDER BY
+    1 DESC;
+select count(distinct user_id) from new_users  ;
+
+--no of comm likes
+
+drop table if exists comm_likes ;
+create temp table comm_likes  as
+SELECT
+    distinct new_users.user_id as user_id,
+    (DATE(dw_user_events_daily.enrolled_joined_at )) AS "joined_date",
+    COALESCE(SUM(dw_user_events_daily.community_likes ), 0) AS "count_community_likes"
+FROM analytics.dw_user_events_daily  AS dw_user_events_daily
+RIGHT JOIN  new_users  AS new_users ON dw_user_events_daily.user_id  = new_users.user_id
+WHERE ((( dw_user_events_daily.enrolled_joined_at  ) >= (TIMESTAMP '2024-04-01') AND ( dw_user_events_daily.enrolled_joined_at  ) <= (TIMESTAMP '2024-04-08'))) AND ((( CASE
+WHEN coalesce(dw_user_events_daily.enrolled_home_domain,'us')='us'  THEN 'us'
+WHEN dw_user_events_daily.enrolled_home_domain='ca'  THEN 'ca'
+WHEN dw_user_events_daily.enrolled_home_domain='au'  THEN 'au'
+WHEN dw_user_events_daily.enrolled_home_domain='in'  THEN 'in'
+WHEN dw_user_events_daily.enrolled_home_domain='uk'  THEN 'uk'
+ELSE 'New Home Domain'
+END ) ILIKE  'us') AND (( CASE
+WHEN dw_user_events_daily.enrolled_reg_app in ('iphone','ipad')  THEN 'iOS'
+WHEN dw_user_events_daily.enrolled_reg_app = 'android'  THEN 'Android'
+WHEN dw_user_events_daily.enrolled_reg_app = 'web'  THEN 'Web'
+ELSE 'Other'
+END ) ILIKE  'iOS'))
+AND ((datediff(day,(DATE(dw_user_events_daily.enrolled_joined_at )),(DATE(dw_user_events_daily.event_date )))+1 ) = 1 )
+--And new_users.user_id is not null
+GROUP BY
+    1,2
+ORDER BY
+    2 ;
+
+
+select count(distinct user_id) from comm_likes ;
+select * from comm_likes order by 2,3 desc ;
+
+-- User activity
+
+drop table if exists user_activity ;
+create temp table user_activity as
+select   new_users.joined_date as date ,
+      --(TIMESTAMP 'epoch' + r.at * INTERVAL '1 second') as time_stamp,
+      r.event_date::DATE                    AS event_date,
+       f_pm_epoch_to_pacific(r.at)           AS time_stamp,
+       r.direct_object.name as direct_object,
+       r.verb as verb
+       ,r.on.name as on_name
+       ,new_users.user_id as user_id,
+       rank() over (partition by user_id order by time_stamp ) as rank_users
+from new_users
+join external_spark_tables.raw_events r on new_users.user_id =  r.actor.id and new_users.joined_date = r.event_date
+where
+r.verb in('view','click','like','post','share','update','block','book','post','follow','search','sign_up','sign_in')
+and r.using.app_type in ('iphone','ipad')
+and r.using.domain in ('us')
+and r.actor.id is not null
+and r.direct_object.name is not null
+and r.on.name is not null
+and r.actor.type in ('user')
+--and new_users.joined_date = '2024-04-01'
+and r.event_date = joined_date
+group by 1,2,3,4,5,6,7
+order by 2 ,5  ;
+
+select count(*),count(distinct user_id) from user_activity ;
+select *  from user_activity limit 1;
+
+--Duration spend by user on D1
+
+drop table if exists timelag ;
+create temp table timelag as
+select distinct u.user_id ,sum(case when u.date_diff_seconds<180 then u.date_diff_seconds else null end ) as duration
+from (select distinct ua.user_id,
+                      ua.time_stamp,
+                      ua.prevtime_stamp,
+                      datediff(seconds, ua.prevtime_stamp, ua.time_stamp) as date_diff_seconds,
+                      ua.rank_users
+      from (select distinct user_id,
+                            date,
+                            time_stamp,
+                            lag(time_stamp, 1) over (partition by user_id order by rank_users) as prevtime_stamp,
+                            rank_users
+            from user_activity
+            order by rank_users) as ua
+      order by ua.time_stamp) u
+ group by 1 order by 2 desc
+;
+select count(*),count(distinct user_id) from timelag ;
+
+--Last Page viewed by users D1 
+
+drop table if exists last ;
+create temp table last as
+select distinct user_id,max(rank_users ) as r
+from user_activity
+group by 1 ;
+
+drop table if exists last_page_viewed_D1 ;
+create temp table last_page_viewed_D1 as
+select distinct t.date,t.user_id,
+                case when t.verb = 'view' then t.direct_object
+                    when t.verb = 'click' then t.on_name
+                end as last_page_viewed
+from (select user_activity.user_id,user_activity.date,user_activity.direct_object,user_activity.verb,user_activity.on_name,last.r
+from user_activity
+join last on user_activity.user_id = last.user_id and user_activity.rank_users = last.r) t
+group by 1,2,3
+order by 2 desc;
+
+select count(*),count(distinct user_id) from  last_page_viewed_D1;
+
+--Users returned between D2-D7
+
+drop table if exists returned_users_d2_d7 ;
+create temp table returned_users_d2_d7 as
+SELECT
+    DISTINCT CASE WHEN ( dw_user_events_daily.is_active  ) AND ( dw_user_events_daily.is_valid_user  ) AND (NOT COALESCE(( coalesce((datediff(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),(CASE WHEN dw_users.user_status = 'restricted' THEN dw_users.status_updated_at ELSE NULL END)) + 1) <= 30, FALSE)  ), FALSE)) THEN dw_user_events_daily.user_id  ELSE NULL END  AS "user_id",
+    (DATE(dw_user_events_daily.enrolled_joined_at )) AS "joined_date",
+        (DATE(dw_user_events_daily.event_date )) AS "event_date_date"
+FROM analytics.dw_user_events_daily  AS dw_user_events_daily
+LEFT JOIN analytics.dw_users  AS dw_users ON dw_user_events_daily.user_id  = dw_users.user_id
+WHERE ((( dw_user_events_daily.enrolled_joined_at  ) >= ((TIMESTAMP '2024-04-01')) AND ( dw_user_events_daily.enrolled_joined_at  ) < ((DATEADD(day,1, TIMESTAMP '2024-04-07' ))))) AND ((( CASE
+WHEN coalesce(dw_user_events_daily.enrolled_home_domain,'us')='us'  THEN 'us'
+WHEN dw_user_events_daily.enrolled_home_domain='ca'  THEN 'ca'
+WHEN dw_user_events_daily.enrolled_home_domain='au'  THEN 'au'
+WHEN dw_user_events_daily.enrolled_home_domain='in'  THEN 'in'
+WHEN dw_user_events_daily.enrolled_home_domain='uk'  THEN 'uk'
+ELSE 'New Home Domain'
+END ) ILIKE  'us') AND (( CASE
+WHEN dw_user_events_daily.enrolled_reg_app in ('iphone','ipad')  THEN 'iOS'
+WHEN dw_user_events_daily.enrolled_reg_app = 'android'  THEN 'Android'
+WHEN dw_user_events_daily.enrolled_reg_app = 'web'  THEN 'Web'
+ELSE 'Other'
+END ) ILIKE  'iOS')) AND ((((( datediff(day,(DATE(dw_user_events_daily.enrolled_joined_at )),(DATE(dw_user_events_daily.event_date )))+1  ) >= 2 AND ( datediff(day,(DATE(dw_user_events_daily.enrolled_joined_at )),(DATE(dw_user_events_daily.event_date )))+1  ) <= 7)))  AND ((NOT (coalesce((datediff(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),(CASE WHEN dw_users.user_status = 'restricted' THEN dw_users.status_updated_at ELSE NULL END)) + 1) <= 30, FALSE) ) OR (coalesce((datediff(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),(CASE WHEN dw_users.user_status = 'restricted' THEN dw_users.status_updated_at ELSE NULL END)) + 1) <= 30, FALSE) ) IS NULL) AND ((coalesce(dw_user_events_daily.app, 'unknown')) in ('unknown','iphone','ipad','external','android','web') )))
+GROUP BY
+    1,
+    2,3
+ORDER BY
+    1
+;
+
+select count(*),count(distinct user_id) from  returned_users_d2_d7;
+select * from returned_users_d2_d7 ;
+
+-- Number of total listings created,no of listings published
+
+drop table if exists listings ;
+create temp table listings as
+SELECT
+    new_users.user_id as user_id
+    ,new_users.joined_date
+    ,new_users.lister_activation_date
+     ,sum(dw_user_events_daily.listings_created)   AS "dailycount_listings_created"
+    ,sum(dw_user_events_daily.published_listings)   AS "dailycount_published_listings"
+FROM analytics.dw_user_events_daily  AS dw_user_events_daily
+right JOIN new_users  ON dw_user_events_daily.user_id  = new_users.user_id
+WHERE ((( dw_user_events_daily.enrolled_joined_at  ) >= (TIMESTAMP '2024-04-01') AND ( dw_user_events_daily.enrolled_joined_at  ) < (TIMESTAMP '2024-04-08')))
+and new_users.joined_date = new_users.lister_activation_date
+GROUP BY
+    1,2,3
+ORDER BY
+    3,4;
+
+select count(*),count(distinct user_id) from  listings;
+
+-- No of email send,open,clicks
+
+drop table if exists  email ;
+create temp table email as
+select user_id,event_date,count(distinct uem.campaign_type) as campaign_type,sum(uem.sends) as sends,sum(uem.opens) as opens,sum(uem.clicks) as clicks
+from analytics.dw_user_email_metrics uem
+where
+primary_classification = 'Mass Outreach'
+and event_date between '2024-04-01' and '2024-04-08'
+group by 1,2
+order by 1,5 desc
+;
+select count(*), count(distinct user_id) from email;
+
+--No of push notifications send,clicks
+
+drop table if exists push ;
+create temp table push as
+select user_id,event_date,count(distinct campaign_type) as no_of_campagin_type_email_send,sum(sends) as total_push_sends,sum(clicks) as total_push_clicks
+from analytics.dw_user_push_metrics
+where
+primary_classification in ('Mass Outreach' ,'Social')
+and event_date  between '2024-04-01' and '2024-04-08'
+group by 1,2
+order by 1,5 desc
+;
+
+select count(*), count(distinct user_id) from push;
+
+--Final Dataset for model
+
+drop table if exists user_d1 ;
+create temp table user_d1 as
+SELECT
+   new_users.user_id as user_id
+    ,(DATE(coalesce(dw_users.guest_joined_at, dw_users.joined_at) )) AS "joined_date"
+  ,max(case when (u.verb = 'view' and u.direct_object = 'search') or(u.verb = 'click' and u.on_name = 'search') then '1' else '0' end )as "search_page_viewed"
+  ,max(case when (u.verb = 'view' and u.direct_object = 'shop') or(u.verb = 'click' and u.on_name = 'shop') then '1' else '0' end )as shop_page_viewed
+  ,max(case when (u.verb = 'view' and u.direct_object = 'closet') or(u.verb = 'click' and u.on_name = 'closet') then '1' else '0' end )as closet_page_viewed
+  ,max(case when (u.verb = 'view' and u.direct_object = 'live_show') or(u.verb = 'click' and u.on_name = 'live_show') then '1' else '0' end )as posh_show_page_viewed
+  ,max(case when (u.verb = 'view' and u.direct_object = 'brand') or(u.verb = 'click' and u.on_name = 'brand') then '1' else '0' end) as brand_page_viewed
+  ,max(case when (u.verb = 'view' and u.direct_object = 'search_results') or(u.verb = 'click' and u.on_name = 'search_results') then '1' else '0' end) as search_results_page_viewed
+  ,max(case when (u.verb = 'view' and u.direct_object = 'listing_details') or(u.verb = 'click' and u.on_name = 'listing_details') then '1' else '0' end) as listing_details_page_viewed
+  ,CASE WHEN ( DATEDIFF(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),dw_users.lister_activated_at) + 1  ) = 1 THEN '1'
+      else '0'
+      END  AS "D1_listers"
+   , CASE WHEN ( DATEDIFF(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),dw_users.buyer_activated_at) + 1  ) = 1 THEN '1'
+      else '0'
+      END  AS "D1_buyers"
+    ,CASE WHEN ( DATEDIFF(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),dw_users.seller_activated_at) + 1  ) = 1 THEN '1'
+      else '0'
+      END  AS "D1_sellers"
+  ,cl.count_community_likes
+  ,t.duration
+  ,l.last_page_viewed
+  ,li.dailycount_listings_created
+  ,li.dailycount_published_listings
+  ,e.sends as total_email_send
+,e.campaign_type as total_email_campaigns
+     ,e.opens as total_email_opened
+     ,e.clicks as total_email_clicks
+  ,p.total_push_sends as total_push_sends
+  ,p.total_push_clicks as total_push_clicked
+  ,p.no_of_campagin_type_email_send as total_push_campaign
+  ,case when r.user_id = new_users.user_id then '1'
+   else '0' end as "user_returned_D2-D7"
+
+FROM analytics.dw_users  AS dw_users
+right join new_users on new_users.user_id = dw_users.user_id
+left join comm_likes cl on new_users.user_id = cl.user_id
+left join timelag t on cl.user_id = t.user_id
+left join last_page_viewed_D1 l on cl.user_id = l.user_id
+left join returned_users_d2_d7 r on new_users.user_id = r.user_id
+left join listings li on new_users.user_id = li.user_id
+left join user_activity u on new_users.user_id = u.user_id
+left join push p on new_users.user_id = p.user_id and new_users.joined_date = p.event_date
+left join email e on new_users.user_id = e.user_id and new_users.joined_date = e.event_date
+WHERE ((( coalesce(dw_users.guest_joined_at, dw_users.joined_at)  ) >= (TIMESTAMP '2024-04-01') AND ( coalesce(dw_users.guest_joined_at, dw_users.joined_at)  ) < (TIMESTAMP '2024-04-08'))) AND ((NOT (coalesce((datediff(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),(CASE WHEN dw_users.user_status = 'restricted' THEN dw_users.status_updated_at ELSE NULL END)) + 1) <= 30, FALSE) ) OR (coalesce((datediff(day,(coalesce(dw_users.guest_joined_at, dw_users.joined_at)),(CASE WHEN dw_users.user_status = 'restricted' THEN dw_users.status_updated_at ELSE NULL END)) + 1) <= 30, FALSE) ) IS NULL) AND (( CASE
+WHEN coalesce(dw_users.home_domain,'us')='us'  THEN 'us'
+WHEN dw_users.home_domain='ca'  THEN 'ca'
+WHEN dw_users.home_domain='au'  THEN 'au'
+WHEN dw_users.home_domain='in'  THEN 'in'
+WHEN dw_users.home_domain='uk'  THEN 'uk'
+ELSE 'New Home Domain'
+END ) ILIKE  'us')) AND ((dw_users.is_valid_user is true ) AND ((( CASE
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) in ('iphone','ipad')  THEN 'iOS'
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) = 'android'  THEN 'Android'
+WHEN (coalesce(dw_users.guest_reg_app,dw_users.reg_app)) = 'web'  THEN 'Web'
+ELSE 'Other'
+END ) ILIKE  'iOS') AND ((dw_users.is_valid_user is true))))
+and t.duration is not null
+GROUP BY
+    1,2,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25
+ORDER BY
+    2,14 desc
+;
